@@ -41,6 +41,7 @@ class ArmGenerator(NimbleListener):
     def enterMain(self, ctx: NimbleParser.MainContext):
         self.current_scope = self.current_scope.child_scope_named('$main')
 
+
     def exitScript(self, ctx: NimbleParser.ScriptContext):
         self.arm[ctx] = templates.script.format(
             string_literals='\n'.join(f'{label}: .asciz {string}'
@@ -49,7 +50,7 @@ class ArmGenerator(NimbleListener):
         )
 
     def exitMain(self, ctx: NimbleParser.MainContext):
-        self.arm[ctx] = self.arm[ctx.body()]
+        self.arm[ctx] = "mov fp, sp\n" + self.arm[ctx.body()]
         self.current_scope = self.current_scope.enclosing_scope
 
     def exitBlock(self, ctx: NimbleParser.BlockContext):
@@ -57,15 +58,15 @@ class ArmGenerator(NimbleListener):
 
     def exitBoolLiteral(self, ctx: NimbleParser.BoolLiteralContext):
         value = 1 if ctx.BOOL().getText() == 'true' else 0
-        self.arm[ctx] = 'mov r0, {}'.format(value)
+        self.arm[ctx] = 'mov r0, {}\n'.format(value)
 
     def exitIntLiteral(self, ctx: NimbleParser.IntLiteralContext):
-        self.arm[ctx] = 'mov r0, {}'.format(ctx.INT().getText())
+        self.arm[ctx] = 'mov r0, {}\n'.format(ctx.INT().getText())
 
     def exitStringLiteral(self, ctx: NimbleParser.StringLiteralContext):
         label = self.unique_label('string')
         self.string_literals[label] = ctx.getText()
-        self.arm[ctx] = 'ldr r0, ={}'.format(label)
+        self.arm[ctx] = 'ldr r0, ={}\n'.format(label)
 
     def exitPrint(self, ctx: NimbleParser.PrintContext):
         """
@@ -86,34 +87,57 @@ class ArmGenerator(NimbleListener):
     # ---------------------------------------------------------------------------------
 
     def exitBody(self, ctx: NimbleParser.BodyContext):
-        # TODO: extend to include varBlock
-        self.arm[ctx] = self.arm[ctx.block()]
+        temp = self.arm[ctx.varBlock()]
+        temp += self.arm[ctx.block()]
+        self.arm[ctx] = temp
 
     def exitAddSub(self, ctx: NimbleParser.AddSubContext):
-        # TODO: extend for String concatenation
-        self.arm[ctx] = templates.add_sub.format(
-            operation='add' if ctx.op.text == '+' else 'sub',
-            expr0=self.arm[ctx.expr(0)],
-            expr1=self.arm[ctx.expr(1)]
-        )
+        if self.types[ctx.expr(0)] == PrimitiveType.Int:
+            self.arm[ctx] = templates.add_sub.format(
+                operation='add' if ctx.op.text == '+' else 'sub',
+                expr0=self.arm[ctx.expr(0)],
+                expr1=self.arm[ctx.expr(1)]
+            )
+        else:
+            self.arm[ctx] = templates.cat.format(
+                expr0=self.arm[ctx.expr(0)],
+                expr1=self.arm[ctx.expr(1)]
+            )
 
     def exitIf(self, ctx: NimbleParser.IfContext):
-        # TODO: extend to support `else`
-        self.arm[ctx] = templates.if_.format(
-            condition=self.arm[ctx.expr()],
-            true_block=self.arm[ctx.block(0)],
-            endif_label=self.unique_label('endif')
-        )
+        if not ctx.block(1):
+            command = templates.if_.format(
+                condition=self.arm[ctx.expr()],
+                true_block=self.arm[ctx.block(0)],
+                endif_label=self.unique_label('endif')
+            )
+        else:
+            command = templates.if_else.format(
+                condition=self.arm[ctx.expr()],
+                true_block=self.arm[ctx.block(0)],
+                false_block=self.arm[ctx.block(1)],
+                true_label = self.unique_label('true'),
+                false_label = self.unique_label('false'),
+                endif_label=self.unique_label('endif')
+            )
+        self.arm[ctx] = command
 
     # ---------------------------------------------------------------------------------
     # Yours to implement - see lab instructions for suggested order
     # ---------------------------------------------------------------------------------
 
     def exitVarBlock(self, ctx: NimbleParser.VarBlockContext):
-        pass
+        list = []
+        for var in ctx.varDec():
+            list.append(self.arm[var])
+        self.arm[ctx] = "\n".join(list)
 
     def exitVarDec(self, ctx: NimbleParser.VarDecContext):
-        pass
+        if ctx.expr():  #if vardec has an assignment
+            expression = self.arm[ctx.expr()]
+            self.arm[ctx] = expression + f"str r0, [sp, #-4]!\n"
+        else:
+            self.arm[ctx] =  f"\nstr r0, [sp, #-4]!\n"
 
     def exitAssignment(self, ctx: NimbleParser.AssignmentContext):
         #go to var index on stack
@@ -121,7 +145,7 @@ class ArmGenerator(NimbleListener):
         frame_pointer_offset = 4 * (-1 * (symbol.index+1))
         expression = self.arm[ctx.expr()]
         #change it based on what is in
-        command = expression + f"\nstr r0, [fp, #{frame_pointer_offset}]"
+        command = expression + f"str r0, [fp, #{frame_pointer_offset}]\n"
         self.arm[ctx] = command
 
     #'while' expr '{' block '}'
@@ -130,6 +154,8 @@ class ArmGenerator(NimbleListener):
         endLabel=self.unique_label("while")
         continue_me = self.arm[ctx.expr()]
         block_statement = self.arm[ctx.block()]
+
+
         command = f"{whileLabel}:\n" + continue_me + (f"\ncbz r0, {endLabel}\n"
                                  f"{block_statement}\n"
                                  f"b {whileLabel}\n"
@@ -138,9 +164,11 @@ class ArmGenerator(NimbleListener):
 
     def exitNeg(self, ctx: NimbleParser.NegContext):
         if ctx.op.text == '!':
-            self.arm[ctx] = "EOR r0, r0, 0b1"
+
+            self.arm[ctx] = self.arm[ctx.expr()]+"EOR r0, r0, 0b1\n"
         else:
-            self.arm[ctx] = "sub r0,#0,r0"
+
+            self.arm[ctx] = self.arm[ctx.expr()]+"mov r1, #0\nsub r0,r1,r0\n"
 
     # Rolls up an expression contained inside parentheses #
     def exitParens(self, ctx: NimbleParser.ParensContext):
@@ -155,34 +183,37 @@ class ArmGenerator(NimbleListener):
         #if it's a variable, the variable node will have put it in r0
 
         temp=self.arm[ctx.expr(0)]
-        temp+="\nstr r0, [sp, #-4]!"
+        temp+="str r0, [sp, #-4]!\n"
 
         temp+=self.arm[ctx.expr(1)]
-        temp+="\nstr r0, [sp, #-4]!"
-        temp+="\nldr r0, [sp], 4"
-        temp+="\nldr r1, [sp], 4"
+        temp+="str r0, [sp, #-4]!\n"
+        temp+="ldr r0, [sp], 4\n"
+        temp+="ldr r1, [sp], 4\n"
 
         if ctx.op.text == '<':
-            temp+=f"\nBLT r0, r1, {trueLabel}"
-            temp+=f"\nB {falseLabel}"
+            temp+=f"CMP r1, r0\n"
+            temp+=f"BLT {trueLabel}\n"
+            temp+=f"B {falseLabel}\n"
 
         if ctx.op.text == '<=':
-            temp+=f"\nBLE r0, r0, {trueLabel}"
-            temp+=f"\nB {falseLabel}"
+            temp += f"cmp r1, r0 \n"
+            temp+=f"BLE {trueLabel}\n"
+            temp+=f"B {falseLabel}\n"
 
         if ctx.op.text == '==':
-            temp+=f"\nBEQ r0, r0, {trueLabel}"
-            temp+=f"\nB {falseLabel}"
+            temp += f"cmp r1, r0 \n"
+            temp+=f"BEQ {trueLabel}\n"
+            temp+=f"B {falseLabel}\n"
 
-            temp+=f"\n{falseLabel}: "
-            temp+="\nLDR r0, 0"
-            temp+=f"\nB {endLabel}"
+        temp+=f"{falseLabel}: \n"
+        temp+="MOV r0, #0\n"
+        temp+=f"B {endLabel}\n"
 
-            temp+=f"\n{trueLabel}: "
-            temp+="\nLDR r0, 1"
-            temp+=f"\nB {endLabel}"
+        temp+=f"{trueLabel}: \n"
+        temp+="MOV r0, #1\n"
+        temp+=f"B {endLabel}\n"
 
-            temp+=f"\n{endLabel}"
+        temp+=f"{endLabel}:\n"
 
         self.arm[ctx]=temp
 
@@ -196,7 +227,7 @@ class ArmGenerator(NimbleListener):
         else:
             frame_pointer_offset = symbol.index + 1
         offset = frame_pointer_offset * -4
-        command = f'\nldr r0, [fp, #{offset}]'
+        command = f'ldr r0, [fp, #{offset}]\n'
 
         self.arm[ctx] = command
 
